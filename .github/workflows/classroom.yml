@@ -1,0 +1,80 @@
+name: Autograding Tests
+on:
+  - push
+  - workflow_dispatch
+permissions:
+  checks: write
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: write
+jobs:
+  run-autograding-tests:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-classroom[bot]'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: 3.11
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --dev --frozen
+
+      - name: Convert notebook
+        run: uv run python lab_utils/convert_notebook.py
+
+      - name: Run Autograding
+        id: run-pytest
+        continue-on-error: true
+        run: uv run --frozen pytest -q --tb=no --no-summary --disable-warnings --junitxml=result.xml
+
+      - name: Prepare Report
+        id: pytest
+        if: always()
+        run: uv run --frozen python lab_utils/format_report.py result.xml
+
+      - name: Report Grade
+        if: always()
+        uses: fuisl/autograding-grading-reporter@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PYTEST_RESULTS: ${{ steps.pytest.outputs.result }}
+        with:
+          runners: pytest
+
+      - name: Comment results on PR #1 if available
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'comment.md';
+
+            if (!fs.existsSync(path)) {
+              core.info('comment.md not found; skipping PR comment.');
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = 1;
+
+            try {
+              await github.rest.pulls.get({ owner, repo, pull_number: issue_number });
+            } catch (error) {
+              core.info(`PR #1 not available; skipping comment. ${error.message}`);
+              return;
+            }
+
+            const body = fs.readFileSync(path, 'utf8').trim();
+            if (!body) {
+              core.info('comment.md is empty; skipping PR comment.');
+              return;
+            }
+
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            core.info('Posted grading results to PR #1.');
