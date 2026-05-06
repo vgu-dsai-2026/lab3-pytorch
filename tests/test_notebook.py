@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-
-import sys
+import torch
+from PIL import Image
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 
 # -----------------------------------------------------------------------------
 # MODULE BOOTSTRAP
@@ -21,543 +25,396 @@ NOTEBOOK_MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None and SPEC.loader is not None
 SPEC.loader.exec_module(NOTEBOOK_MODULE)
 
-# Public API imported from student notebook
-list_image_paths_for_group   = NOTEBOOK_MODULE.list_image_paths_for_group
-inspect_image_file           = NOTEBOOK_MODULE.inspect_image_file
-build_metadata_from_folders  = NOTEBOOK_MODULE.build_metadata_from_folders
-load_metadata_table          = NOTEBOOK_MODULE.load_metadata_table
-summarize_metadata           = NOTEBOOK_MODULE.summarize_metadata
-build_label_split_table      = NOTEBOOK_MODULE.build_label_split_table
-audit_metadata               = NOTEBOOK_MODULE.audit_metadata
-add_analysis_columns         = NOTEBOOK_MODULE.add_analysis_columns
-build_split_characteristics_table = NOTEBOOK_MODULE.build_split_characteristics_table
-sample_balanced_by_split_and_label = NOTEBOOK_MODULE.sample_balanced_by_split_and_label
+SEED = NOTEBOOK_MODULE.SEED
+LABELS = NOTEBOOK_MODULE.LABELS
 
-# Safe project root (works in scripts + notebooks)
-try:
-    PROJECT_ROOT = Path(__file__).resolve().parent.parent
-except NameError:
-    PROJECT_ROOT = Path.cwd()
-
-DATA_ROOT              = PROJECT_ROOT / "data"
-GENERATED_METADATA_PATH = PROJECT_ROOT / "artifacts" / f"lab2_faces_metadata.csv"
-SEED                   = NOTEBOOK_MODULE.SEED
+build_label_mapping = NOTEBOOK_MODULE.build_label_mapping
+image_to_tensor = NOTEBOOK_MODULE.image_to_tensor
+CatsDogsDataset = NOTEBOOK_MODULE.CatsDogsDataset
+build_dataloaders = NOTEBOOK_MODULE.build_dataloaders
+inspect_first_batch = NOTEBOOK_MODULE.inspect_first_batch
+CatsDogsSimpleCNN = NOTEBOOK_MODULE.CatsDogsSimpleCNN
+setup_training = NOTEBOOK_MODULE.setup_training
+train_one_epoch = NOTEBOOK_MODULE.train_one_epoch
+evaluate = NOTEBOOK_MODULE.evaluate
+run_training_experiment = NOTEBOOK_MODULE.run_training_experiment
 
 
 # -----------------------------------------------------------------------------
-# Question 1: list_image_paths_for_group  /  inspect_image_file
+# SHARED TEST HELPERS
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("split", "label"),
-    [
-        pytest.param("train", "cat", id="train-cat-returns-nonempty-paths"),
-        pytest.param("test",  "dog", id="test-dog-returns-nonempty-paths"),
-    ],
-)
-def test_list_image_paths_for_group_nonempty(split: str, label: str) -> None:
-    paths = list_image_paths_for_group(DATA_ROOT, split, label)
+def write_rgb_image(path: Path, color: tuple[int, int, int], size: tuple[int, int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+    image[..., 0] = color[0]
+    image[..., 1] = color[1]
+    image[..., 2] = color[2]
+    Image.fromarray(image, mode="RGB").save(path)
 
-    print(paths)
 
-    assert isinstance(paths, list), "Result must be a list"
-    assert len(paths) > 0, f"Expected at least one image for split={split}, label={label}"
-    assert all(isinstance(p, Path) for p in paths), "Every item must be a Path"
-    assert all(p.exists() for p in paths), "Every path must exist on disk"
-    assert all(
-        p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"} for p in paths
-    ), "Every path must point to an image file"
+class IndexedDataset(Dataset):
+    def __init__(self, frame: pd.DataFrame, data_root: Path):
+        self.frame = frame.reset_index(drop=True)
+        self.data_root = data_root
 
-@pytest.mark.parametrize(
-    ("filepath", "expected_width", "expected_height", "expected_mean"),
-    [
-        ("test/cat/cat_0009.jpg", 64, 64, 0.657925),
-        ("test/cat/cat_0010.jpg", 64, 64, 0.454074),
-        ("test/dog/dog_0009.jpg", 64, 64, 0.274566),
-        ("test/dog/dog_0010.jpg", 64, 64, 0.537693),
-    ],
-)
-def test_inspect_image_file_exact_values(filepath, expected_width, expected_height, expected_mean):
-    path = DATA_ROOT / filepath
+    def __len__(self) -> int:
+        return len(self.frame)
 
-    assert path.exists(), f"File does not exist: {path}"
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        row = self.frame.iloc[index]
+        image = torch.full((3, 4, 4), float(row["sample_id"]), dtype=torch.float32)
+        label = torch.tensor(int(row["label_id"]), dtype=torch.long)
+        return image, label
 
-    width, height, mean_intensity = inspect_image_file(path)
 
-    # Exact checks for integers
-    assert width == expected_width, f"Width mismatch for {filepath}"
-    assert height == expected_height, f"Height mismatch for {filepath}"
+def make_tiny_loader(
+    num_samples: int = 6,
+    batch_size: int = 2,
+    image_shape: tuple[int, int, int] = (3, 8, 8),
+) -> DataLoader:
+    generator = torch.Generator().manual_seed(SEED)
+    images = torch.randn((num_samples, *image_shape), generator=generator)
+    labels = torch.tensor([idx % 2 for idx in range(num_samples)], dtype=torch.long)
+    return DataLoader(TensorDataset(images, labels), batch_size=batch_size, shuffle=False)
 
-    # Approximate check for float
-    assert mean_intensity == pytest.approx(expected_mean, rel=1e-3), (
-        f"Mean intensity mismatch for {filepath}: "
-        f"expected {expected_mean}, got {mean_intensity}"
+
+def make_tiny_model(input_shape: tuple[int, int, int] = (3, 8, 8)) -> nn.Module:
+    channels, height, width = input_shape
+    return nn.Sequential(nn.Flatten(), nn.Linear(channels * height * width, 2))
+
+
+@pytest.fixture()
+def split_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "filepath": [
+                "train/cat/cat_0.png",
+                "train/dog/dog_0.png",
+                "val/cat/cat_1.png",
+                "test/dog/dog_1.png",
+            ],
+            "label": ["cat", "dog", "cat", "dog"],
+            "split": ["train", "train", "val", "test"],
+        }
     )
 
-# -----------------------------------------------------------------------------
-# Question 2: load_metadata_table
-# -----------------------------------------------------------------------------
 
-@pytest.fixture(scope="session")
-def metadata_path() -> Path:
-    GENERATED_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # build_metadata_from_folders should create the CSV file
-    folder_df = build_metadata_from_folders(DATA_ROOT)
-    folder_df.to_csv(GENERATED_METADATA_PATH, index=False)
-
-
-    assert GENERATED_METADATA_PATH.exists(), (
-        f"Metadata file was not created: {GENERATED_METADATA_PATH}"
-    )
-    return GENERATED_METADATA_PATH
-
-def test_build_and_load_metadata(metadata_path: Path) -> None:
-    df = load_metadata_table(metadata_path)
-
-    assert isinstance(df, pd.DataFrame)
-    assert metadata_path.exists()
-
-    required_columns = {
-        "filepath", "label", "split",
-        "width", "height", "mean_intensity"
-    }
-    assert required_columns.issubset(df.columns)
-
-
-@pytest.mark.parametrize(
-    ("column", "expected_dtype_kind"),
-    [
-        ("width", "i"),
-        ("mean_intensity", "f"),
-    ],
-)
-def test_load_metadata_table_dtypes(metadata_path: Path, column: str, expected_dtype_kind: str):
-    df = load_metadata_table(metadata_path)
-
-    assert df[column].dtype.kind == expected_dtype_kind
+@pytest.fixture()
+def image_dataset_root(tmp_path: Path) -> Path:
+    write_rgb_image(tmp_path / "train" / "cat" / "cat_0.png", color=(255, 0, 0), size=(20, 10))
+    write_rgb_image(tmp_path / "train" / "dog" / "dog_0.png", color=(0, 255, 0), size=(12, 18))
+    write_rgb_image(tmp_path / "val" / "cat" / "cat_1.png", color=(0, 0, 255), size=(16, 16))
+    write_rgb_image(tmp_path / "test" / "dog" / "dog_1.png", color=(128, 64, 32), size=(14, 11))
+    return tmp_path
 
 
 # -----------------------------------------------------------------------------
-# Question 3: summarize_metadata
+# Question 1: build_label_mapping
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("key",),
-    [
-        pytest.param("rows",         id="summary-contains-rows-key"),
-        pytest.param("columns",      id="summary-contains-columns-key"),
-        pytest.param("class_counts", id="summary-contains-class-counts-key"),
-        pytest.param("split_counts", id="summary-contains-split-counts-key"),
-    ],
-)
-def test_summarize_metadata_keys(key: str) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    summary = summarize_metadata(df)
+def test_build_label_mapping_creates_expected_mapping_and_label_ids(split_frame: pd.DataFrame) -> None:
+    label_to_index, labeled, *_ = build_label_mapping(split_frame)
 
-    assert isinstance(summary, dict), "Result must be a dict"
-    assert key in summary, f"Key '{key}' is missing from the summary dict"
+    assert label_to_index == {"cat": 0, "dog": 1}
+    assert "label_id" in labeled.columns
+    assert labeled["label_id"].tolist() == [0, 1, 0, 1]
 
 
-@pytest.mark.parametrize(
-    ("expected_labels", "expected_splits"),
-    [
-        pytest.param(
-            {"cat", "dog"},
-            {"train", "val", "test"},
-            id="class-counts-and-split-counts-cover-all-groups",
-        )
-    ],
-)
-def test_summarize_metadata_values(
-    expected_labels: set[str], expected_splits: set[str]
+def test_build_label_mapping_returns_expected_split_frames(split_frame: pd.DataFrame) -> None:
+    _, labeled, train_df, val_df, test_df = build_label_mapping(split_frame)
+
+    assert len(train_df) == 2
+    assert len(val_df) == 1
+    assert len(test_df) == 1
+    assert labeled is not split_frame
+
+
+# -----------------------------------------------------------------------------
+# Question 2: image_to_tensor / CatsDogsDataset
+# -----------------------------------------------------------------------------
+
+
+def test_image_to_tensor_returns_normalized_channel_first_tensor(image_dataset_root: Path) -> None:
+    tensor = image_to_tensor(image_dataset_root / "train" / "cat" / "cat_0.png")
+
+    assert isinstance(tensor, torch.Tensor)
+    assert tensor.dtype == torch.float32
+    assert tensor.shape == (3, 64, 64)
+    assert float(tensor.min()) >= 0.0
+    assert float(tensor.max()) <= 1.0
+
+
+def test_catsdogs_dataset_returns_tensor_and_long_label(
+    split_frame: pd.DataFrame, image_dataset_root: Path
 ) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    summary = summarize_metadata(df)
+    _, labeled, *_ = build_label_mapping(split_frame)
+    dataset = CatsDogsDataset(labeled[labeled["split"] == "train"], image_dataset_root)
 
-    assert summary["rows"] == len(df), (
-        f"summary['rows'] is {summary['rows']} but DataFrame has {len(df)} rows"
-    )
-    assert set(summary["class_counts"].index) == expected_labels, (
-        f"class_counts index {set(summary['class_counts'].index)} != {expected_labels}"
-    )
-    assert set(summary["split_counts"].index) == expected_splits, (
-        f"split_counts index {set(summary['split_counts'].index)} != {expected_splits}"
-    )
+    image_tensor, label_tensor = dataset[0]
 
-def test_summarize_metadata_exact_values():
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    summary = summarize_metadata(df)
-
-    # Class counts
-    expected_class_counts = {"cat": 10, "dog": 10}
-    actual_class_counts = summary["class_counts"].to_dict()
-
-    assert actual_class_counts == expected_class_counts, (
-        f"Expected class counts {expected_class_counts}, got {actual_class_counts}"
-    )
-
-    # Split counts (total)
-    expected_split_counts = {"train": 12, "val": 4, "test": 4}
-    actual_split_counts = summary["split_counts"].to_dict()
-
-    assert actual_split_counts == expected_split_counts, (
-        f"Expected split counts {expected_split_counts}, got {actual_split_counts}"
-    )
+    assert len(dataset) == 2
+    assert image_tensor.shape == (3, 64, 64)
+    assert image_tensor.dtype == torch.float32
+    assert label_tensor.dtype == torch.long
+    assert int(label_tensor.item()) == 0
 
 
 # -----------------------------------------------------------------------------
-# Question 4: build_label_split_table
+# Question 3: build_dataloaders
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("expected_index", "expected_columns"),
-    [
-        pytest.param(
-            {"cat", "dog"},
-            {"train", "val", "test"},
-            id="labels-are-index-splits-are-columns",
-        )
-    ],
-)
-def test_build_label_split_table_structure(
-    expected_index: set[str], expected_columns: set[str]
+@pytest.fixture()
+def indexed_split_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    frame = pd.DataFrame(
+        {
+            "filepath": [f"unused_{idx}.png" for idx in range(8)],
+            "label": ["cat", "dog", "cat", "dog", "cat", "dog", "cat", "dog"],
+            "split": ["train", "train", "train", "train", "val", "val", "test", "test"],
+            "label_id": [0, 1, 0, 1, 0, 1, 0, 1],
+            "sample_id": list(range(8)),
+        }
+    )
+    return (
+        frame[frame["split"] == "train"].copy(),
+        frame[frame["split"] == "val"].copy(),
+        frame[frame["split"] == "test"].copy(),
+    )
+
+
+def test_build_dataloaders_returns_three_loaders_with_expected_batch_size(
+    indexed_split_frames: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], tmp_path: Path
 ) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    table = build_label_split_table(df)
-
-    assert isinstance(table, pd.DataFrame), "Result must be a DataFrame"
-    assert expected_index.issubset(set(table.index)), (
-        f"Table index {set(table.index)} must include {expected_index}"
-    )
-    assert expected_columns.issubset(set(table.columns)), (
-        f"Table columns {set(table.columns)} must include {expected_columns}"
-    )
-
-
-@pytest.mark.parametrize(
-    ("label", "split"),
-    [
-        pytest.param("cat", "train", id="cat-train-cell-matches-raw-count"),
-        pytest.param("dog", "test",  id="dog-test-cell-matches-raw-count"),
-    ],
-)
-def test_build_label_split_table_counts(label: str, split: str) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    table = build_label_split_table(df)
-
-    expected = int(((df["label"] == label) & (df["split"] == split)).sum())
-    actual   = int(table.loc[label, split])
-    assert actual == expected, (
-        f"table.loc['{label}', '{split}'] == {actual}, expected {expected}"
+    train_df, val_df, test_df = indexed_split_frames
+    train_loader, val_loader, test_loader = build_dataloaders(
+        train_df,
+        val_df,
+        test_df,
+        tmp_path,
+        batch_size=2,
+        seed=SEED,
+        dataset_cls=IndexedDataset,
     )
 
-
-# -----------------------------------------------------------------------------
-# Question 5: audit_metadata
-# -----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("key",),
-    [
-        pytest.param("missing_values",     id="audit-contains-missing-values-key"),
-        pytest.param("duplicate_filepaths", id="audit-contains-duplicate-filepaths-key"),
-        pytest.param("bad_labels",          id="audit-contains-bad-labels-key"),
-        pytest.param("non_positive_sizes",  id="audit-contains-non-positive-sizes-key"),
-    ],
-)
-def test_audit_metadata_keys(key: str) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    report = audit_metadata(df)
-
-    assert isinstance(report, dict), "Result must be a dict"
-    assert key in report, f"Key '{key}' is missing from the audit report"
+    assert isinstance(train_loader, DataLoader)
+    assert isinstance(val_loader, DataLoader)
+    assert isinstance(test_loader, DataLoader)
+    assert train_loader.batch_size == 2
+    assert len(train_loader.dataset) == 4
+    assert len(val_loader.dataset) == 2
+    assert len(test_loader.dataset) == 2
 
 
-@pytest.mark.parametrize(
-    ("injected_label", "should_flag"),
-    [
-        pytest.param("bird",  True,  id="injected-bad-label-is-flagged"),
-        pytest.param("cat",   False, id="clean-dataframe-has-no-bad-labels"),
-    ],
-)
-def test_audit_metadata_bad_labels(injected_label: str, should_flag: bool) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-
-    if should_flag:
-        dirty = df.copy()
-        dirty.loc[0, "label"] = injected_label
-        report = audit_metadata(dirty)
-        assert injected_label in report["bad_labels"], (
-            f"'{injected_label}' should appear in bad_labels but got: {report['bad_labels']}"
-        )
-    else:
-        report = audit_metadata(df)
-        assert report["bad_labels"] == [], (
-            f"Clean DataFrame should have no bad_labels, got: {report['bad_labels']}"
-        )
-
-def test_audit_metadata_missing_values():
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-
-    dirty = df.copy()
-    dirty.loc[0, "width"] = np.nan
-
-    report = audit_metadata(dirty)
-
-    assert report["missing_values"]["width"] > 0
-
-def test_audit_metadata_duplicate_filepaths():
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-
-    dirty = pd.concat([df, df.iloc[[0]]], ignore_index=True)
-
-    report = audit_metadata(dirty)
-
-    assert report["duplicate_filepaths"] > 0, (
-        f"Expected duplicate_filepaths > 0, got {report['duplicate_filepaths']}"
-    )
-
-def test_audit_metadata_non_positive_sizes():
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-
-    dirty = df.copy()
-    dirty.loc[0, "width"] = 0   # invalid
-    dirty.loc[1, "height"] = -1 # invalid
-
-    report = audit_metadata(dirty)
-
-    assert report["non_positive_sizes"] > 0, (
-        f"Expected non_positive_sizes > 0, got {report['non_positive_sizes']}"
-    )
-
-# -----------------------------------------------------------------------------
-# Question 6: add_analysis_columns
-# -----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("column",),
-    [
-        pytest.param("pixel_count",     id="pixel-count-column-added"),
-        pytest.param("aspect_ratio",    id="aspect-ratio-column-added"),
-        pytest.param("brightness_band", id="brightness-band-column-added"),
-        pytest.param("size_bucket",     id="size-bucket-column-added"),
-    ],
-)
-def test_add_analysis_columns_present(column: str) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    result = add_analysis_columns(df)
-
-    assert column in result.columns, f"Column '{column}' is missing from the result"
-
-
-def test_add_analysis_columns_exact_values():
-    df = pd.DataFrame({
-        "width": [10, 20],
-        "height": [5, 4],
-        "mean_intensity": [0.2, 0.8],
-        "label": ["cat", "dog"],
-        "split": ["train", "val"],
-        "filepath": ["a.jpg", "b.jpg"],
-    })
-
-    result = add_analysis_columns(df)
-
-    # pixel_count = width * height
-    expected_pixel = pd.Series([50, 80], name="pixel_count")
-    pd.testing.assert_series_equal(
-        result["pixel_count"].reset_index(drop=True),
-        expected_pixel,
-        check_dtype=False,
-    )
-
-    # aspect_ratio = width / height
-    expected_ratio = pd.Series([2.0, 5.0], name="aspect_ratio")
-    pd.testing.assert_series_equal(
-        result["aspect_ratio"].reset_index(drop=True),
-        expected_ratio,
-        check_dtype=False,
-    )
-
-
-# ---------------------------------------------------------------------
-# brightness_band test (controlled quantiles)
-# ---------------------------------------------------------------------
-
-def test_add_analysis_columns_brightness_band():
-    df = pd.DataFrame({
-        "width": [10] * 8,
-        "height": [10] * 8,
-        "mean_intensity": [
-            0.1, 0.2,   # dark
-            0.3, 0.4,   # dim
-            0.5, 0.6,   # bright
-            0.7, 0.8    # very_bright
-        ],
-        "label": ["cat"] * 8,
-        "split": ["train"] * 8,
-        "filepath": [f"img_{i}.jpg" for i in range(8)],
-    })
-
-    result = add_analysis_columns(df)
-
-    expected_labels = [
-        "darkest", "darkest",
-        "dim", "dim",
-        "bright", "bright",
-        "brightest", "brightest",
-    ]
-
-    actual_labels = result["brightness_band"].astype(str).tolist()
-
-    assert actual_labels == expected_labels, (
-        f"Expected {expected_labels}, got {actual_labels}"
-    )
-
-
-# ---------------------------------------------------------------------
-# size_bucket test (relative behavior, not implementation-specific)
-# ---------------------------------------------------------------------
-
-def test_add_analysis_columns_size_bucket():
-    reference = 64 * 64  # expected reference size
-
-    df = pd.DataFrame({
-        "width":  [32, 64, 128],
-        "height": [32, 64, 128],
-        "mean_intensity": [0.2, 0.5, 0.8],
-        "label": ["cat", "cat", "dog"],
-        "split": ["train", "train", "train"],
-        "filepath": ["small.jpg", "medium.jpg", "large.jpg"],
-    })
-
-    result = add_analysis_columns(df)
-
-    pixel_counts = result["pixel_count"]
-    size_bucket  = result["size_bucket"].astype(str)
-
-    # Check relative correctness instead of exact implementation
-    assert size_bucket.iloc[0] == "small", "Expected small for smaller-than-reference image"
-    assert size_bucket.iloc[1] == "medium", "Expected medium for reference-sized image"
-    assert size_bucket.iloc[2] == "large", "Expected large for larger-than-reference image"
-
-
-# -----------------------------------------------------------------------------
-# Question 7: build_split_characteristics_table
-# -----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("expected_index", "expected_columns"),
-    [
-        pytest.param(
-            {"train", "val", "test"},
-            {"avg_width", "avg_height", "avg_pixel_count", "avg_mean_intensity"},
-            id="splits-are-index-numeric-summary-columns",
-        )
-    ],
-)
-def test_build_split_characteristics_table_structure(
-    expected_index: set[str], expected_columns: set[str]
+def test_build_dataloaders_training_loader_is_reproducible(
+    indexed_split_frames: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame], tmp_path: Path
 ) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    analysis = add_analysis_columns(df)
-    table = build_split_characteristics_table(analysis)
-
-    assert isinstance(table, pd.DataFrame), "Result must be a DataFrame"
-    assert expected_index.issubset(set(table.index)), (
-        f"Table index {set(table.index)} must include {expected_index}"
+    train_df, val_df, test_df = indexed_split_frames
+    loaders_a = build_dataloaders(
+        train_df, val_df, test_df, tmp_path, batch_size=2, seed=SEED, dataset_cls=IndexedDataset
     )
-    assert expected_columns.issubset(set(table.columns)), (
-        f"Table columns {set(table.columns)} must include {expected_columns}"
+    loaders_b = build_dataloaders(
+        train_df, val_df, test_df, tmp_path, batch_size=2, seed=SEED, dataset_cls=IndexedDataset
     )
 
+    train_batch_a = next(iter(loaders_a[0]))
+    train_batch_b = next(iter(loaders_b[0]))
 
-@pytest.mark.parametrize(
-    ("split", "column"),
-    [
-        pytest.param("train", "avg_width", id="train-width-mean-matches-groupby-result"),
-        pytest.param("val", "avg_mean_intensity", id="val-brightness-mean-matches-groupby-result"),
-    ],
-)
-def test_build_split_characteristics_table_values(split: str, column: str) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    analysis = add_analysis_columns(df)
-    table = build_split_characteristics_table(analysis)
-
-    expected = (
-        analysis.groupby("split")[["width", "height", "pixel_count", "mean_intensity"]]
-        .mean()
-        .rename(
-            columns={
-                "width": "avg_width",
-                "height": "avg_height",
-                "pixel_count": "avg_pixel_count",
-                "mean_intensity": "avg_mean_intensity",
-            }
-        )
-    )
-    actual = float(table.loc[split, column])
-    assert actual == pytest.approx(float(expected.loc[split, column]), rel=1e-6), (
-        f"table.loc['{split}', '{column}'] == {actual}, expected {expected.loc[split, column]}"
-    )
+    assert torch.equal(train_batch_a[0], train_batch_b[0])
+    assert torch.equal(train_batch_a[1], train_batch_b[1])
 
 
 # -----------------------------------------------------------------------------
-# Question 8: sample_balanced_by_split_and_label
+# Question 4: inspect_first_batch
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("n_per_group", "seed"),
-    [
-        pytest.param(1, SEED,   id="n=1-shape-respects-small-groups"),
-        pytest.param(5, SEED, id="n=5-shape-respects-small-groups"),
-    ],
-)
-def test_sample_balanced_shape(n_per_group: int, seed: int) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    analysis = add_analysis_columns(df)
+def test_inspect_first_batch_returns_first_batch_from_loader() -> None:
+    loader = make_tiny_loader(num_samples=4, batch_size=2, image_shape=(3, 8, 8))
+    expected_images, expected_labels = next(iter(loader))
 
-    grouped = analysis.groupby(["split", "label"])
-    expected_rows = sum(min(n_per_group, len(group)) for _, group in grouped)
+    batch_images, batch_labels = inspect_first_batch(loader)
 
-    sampled = sample_balanced_by_split_and_label(
-        analysis, n_per_group=n_per_group, seed=seed
+    assert torch.equal(batch_images, expected_images)
+    assert torch.equal(batch_labels, expected_labels)
+
+
+def test_inspect_first_batch_rejects_none_loader() -> None:
+    with pytest.raises(ValueError):
+        inspect_first_batch(None)  # type: ignore[arg-type]
+
+
+# -----------------------------------------------------------------------------
+# Question 5: CatsDogsSimpleCNN
+# -----------------------------------------------------------------------------
+
+
+def test_simple_cnn_outputs_two_logits_per_example() -> None:
+    model = CatsDogsSimpleCNN()
+    batch = torch.randn(4, 3, 64, 64)
+    logits = model(batch)
+
+    assert logits.shape == (4, 2)
+    assert hasattr(model, "stage1")
+    assert hasattr(model, "stage2")
+    assert hasattr(model, "classifier")
+
+
+def test_simple_cnn_supports_backward_pass() -> None:
+    model = CatsDogsSimpleCNN()
+    batch = torch.randn(2, 3, 64, 64)
+    labels = torch.tensor([0, 1], dtype=torch.long)
+
+    loss = nn.CrossEntropyLoss()(model(batch), labels)
+    loss.backward()
+
+    assert any(param.grad is not None for param in model.parameters())
+
+
+# -----------------------------------------------------------------------------
+# Question 6: setup_training
+# -----------------------------------------------------------------------------
+
+
+def test_setup_training_returns_expected_components() -> None:
+    model = make_tiny_model()
+    device, moved_model, criterion, optimizer = setup_training(
+        model, device=torch.device("cpu"), learning_rate=5e-4
     )
 
-    assert sampled.shape[0] == expected_rows, (
-        f"Expected {expected_rows} rows, got {sampled.shape[0]}"
+    assert device.type == "cpu"
+    assert moved_model is model
+    assert isinstance(criterion, nn.CrossEntropyLoss)
+    assert isinstance(optimizer, torch.optim.Adam)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(5e-4)
+
+
+def test_setup_training_respects_explicit_device() -> None:
+    model = make_tiny_model()
+    explicit_device = torch.device("cpu")
+
+    device, moved_model, _, _ = setup_training(model, device=explicit_device)
+
+    assert device == explicit_device
+    assert next(moved_model.parameters()).device.type == explicit_device.type
+
+
+# -----------------------------------------------------------------------------
+# Question 7: train_one_epoch
+# -----------------------------------------------------------------------------
+
+
+def test_train_one_epoch_returns_finite_metrics() -> None:
+    loader = make_tiny_loader()
+    model = make_tiny_model()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    loss, accuracy = train_one_epoch(model, loader, optimizer, criterion, torch.device("cpu"))
+
+    assert np.isfinite(loss)
+    assert 0.0 <= accuracy <= 1.0
+
+
+def test_train_one_epoch_updates_model_parameters() -> None:
+    loader = make_tiny_loader()
+    model = make_tiny_model()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    before = [param.detach().clone() for param in model.parameters()]
+
+    train_one_epoch(model, loader, optimizer, criterion, torch.device("cpu"))
+
+    after = list(model.parameters())
+    assert any(not torch.allclose(old, new.detach()) for old, new in zip(before, after))
+
+
+# -----------------------------------------------------------------------------
+# Question 8: evaluate
+# -----------------------------------------------------------------------------
+
+
+def test_evaluate_returns_finite_metrics() -> None:
+    loader = make_tiny_loader()
+    model = make_tiny_model()
+    criterion = nn.CrossEntropyLoss()
+
+    loss, accuracy = evaluate(model, loader, criterion, torch.device("cpu"))
+
+    assert np.isfinite(loss)
+    assert 0.0 <= accuracy <= 1.0
+
+
+def test_evaluate_does_not_update_model_parameters() -> None:
+    loader = make_tiny_loader()
+    model = make_tiny_model()
+    criterion = nn.CrossEntropyLoss()
+    before = [param.detach().clone() for param in model.parameters()]
+
+    evaluate(model, loader, criterion, torch.device("cpu"))
+
+    after = list(model.parameters())
+    assert all(torch.allclose(old, new.detach()) for old, new in zip(before, after))
+
+
+# -----------------------------------------------------------------------------
+# Question 9: run_training_experiment
+# -----------------------------------------------------------------------------
+
+
+def test_run_training_experiment_returns_history_and_metrics_when_baseline_missing(tmp_path: Path) -> None:
+    train_loader = make_tiny_loader()
+    val_loader = make_tiny_loader()
+    test_loader = make_tiny_loader()
+    model = make_tiny_model()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    missing_baseline = tmp_path / "missing_baseline.csv"
+
+    history, test_loss, test_acc, numpy_baseline_acc = run_training_experiment(
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        criterion,
+        optimizer,
+        torch.device("cpu"),
+        epochs=1,
+        baseline_path=missing_baseline,
+        plot=False,
     )
 
+    assert len(history) == 1
+    assert set(history[0]) == {"epoch", "train_loss", "train_acc", "val_loss", "val_acc"}
+    assert np.isfinite(test_loss)
+    assert 0.0 <= test_acc <= 1.0
+    assert numpy_baseline_acc is None
 
-@pytest.mark.parametrize(
-    ("n_per_group", "seed"),
-    [
-        pytest.param(1, SEED,   id="n=1-each-group-respects-limit"),
-        pytest.param(5, SEED, id="n=5-each-group-respects-limit"),
-    ],
-)
-def test_sample_balanced_per_group_counts(n_per_group: int, seed: int) -> None:
-    df = load_metadata_table(GENERATED_METADATA_PATH)
-    analysis = add_analysis_columns(df)
 
-    sampled = sample_balanced_by_split_and_label(
-        analysis, n_per_group=n_per_group, seed=seed
+def test_run_training_experiment_reads_baseline_csv(tmp_path: Path) -> None:
+    train_loader = make_tiny_loader()
+    val_loader = make_tiny_loader()
+    test_loader = make_tiny_loader()
+    model = make_tiny_model()
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    baseline_path = tmp_path / "baseline.csv"
+    pd.DataFrame({"correct_numpy": [1, 0, 1]}).to_csv(baseline_path, index=False)
+
+    history, _, _, numpy_baseline_acc = run_training_experiment(
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        criterion,
+        optimizer,
+        torch.device("cpu"),
+        epochs=1,
+        baseline_path=baseline_path,
+        plot=False,
     )
 
-    original_sizes = analysis.groupby(["split", "label"]).size()
-    sampled_sizes  = sampled.groupby(["split", "label"]).size()
-
-    for key in original_sizes.index:
-        expected = min(n_per_group, original_sizes[key])
-        actual   = sampled_sizes.get(key, 0)
-
-        assert actual == expected, (
-            f"{key}: expected {expected}, got {actual}"
-        )
+    assert len(history) == 1
+    assert numpy_baseline_acc == pytest.approx(2 / 3, rel=1e-6)

@@ -62,16 +62,48 @@ def is_literal_assignment(node: ast.Assign | ast.AnnAssign) -> bool:
     return True
 
 
+ALLOWED_ASSIGN_TARGETS = {
+    "PROJECT_ROOT",
+    "DATA_ROOT",
+    "METADATA_PATH",
+    "ARTIFACT_DIR",
+    "LABELS",
+    "SPLITS",
+    "SEED",
+    "NUMPY_PRED_PATH",
+    "BATCH_SIZE",
+    "EPOCHS",
+}
+
+
+def has_allowed_target(node: ast.Assign | ast.AnnAssign) -> bool:
+    targets: list[ast.expr]
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    else:
+        targets = [node.target]
+
+    for target in targets:
+        if isinstance(target, ast.Name) and target.id in ALLOWED_ASSIGN_TARGETS:
+            return True
+    return False
+
+
 def filter_python(source: str) -> str:
     tree = ast.parse(source)
     kept_nodes: list[ast.stmt] = []
 
     for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(
+            node,
+            (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
             kept_nodes.append(node)
             continue
 
-        if isinstance(node, (ast.Assign, ast.AnnAssign)) and is_literal_assignment(node):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and (
+            is_literal_assignment(node) or has_allowed_target(node)
+        ):
             kept_nodes.append(node)
 
     filtered_tree = ast.Module(body=kept_nodes, type_ignores=[])
