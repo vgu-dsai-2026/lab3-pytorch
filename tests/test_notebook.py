@@ -371,9 +371,8 @@ def test_run_training_experiment_returns_history_and_metrics_when_baseline_missi
     model = make_tiny_model()
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    missing_baseline = tmp_path / "missing_baseline.csv"
 
-    history, test_loss, test_acc, numpy_baseline_acc = run_training_experiment(
+    history, test_loss, test_acc = run_training_experiment(
         model,
         train_loader,
         val_loader,
@@ -382,7 +381,6 @@ def test_run_training_experiment_returns_history_and_metrics_when_baseline_missi
         optimizer,
         torch.device("cpu"),
         epochs=1,
-        baseline_path=missing_baseline,
         plot=False,
     )
 
@@ -390,7 +388,6 @@ def test_run_training_experiment_returns_history_and_metrics_when_baseline_missi
     assert set(history[0]) == {"epoch", "train_loss", "train_acc", "val_loss", "val_acc"}
     assert np.isfinite(test_loss)
     assert 0.0 <= test_acc <= 1.0
-    assert numpy_baseline_acc is None
 
 
 def test_run_training_experiment_reads_baseline_csv(tmp_path: Path) -> None:
@@ -400,10 +397,8 @@ def test_run_training_experiment_reads_baseline_csv(tmp_path: Path) -> None:
     model = make_tiny_model()
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    baseline_path = tmp_path / "baseline.csv"
-    pd.DataFrame({"correct_numpy": [1, 0, 1]}).to_csv(baseline_path, index=False)
 
-    history, _, _, numpy_baseline_acc = run_training_experiment(
+    history, _, _ = run_training_experiment(
         model,
         train_loader,
         val_loader,
@@ -412,9 +407,7 @@ def test_run_training_experiment_reads_baseline_csv(tmp_path: Path) -> None:
         optimizer,
         torch.device("cpu"),
         epochs=1,
-        baseline_path=baseline_path,
         plot=False,
     )
 
     assert len(history) == 1
-    assert numpy_baseline_acc == pytest.approx(2 / 3, rel=1e-6)
